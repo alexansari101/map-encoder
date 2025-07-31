@@ -1,0 +1,13 @@
+[project]
+name = "map-encoder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "geopandas>=1.1.1",
+    "matplotlib>=3.10.3",
+    "numpy>=2.3.2",
+    "osmnx>=2.0.5",
+    "torch>=2.7.1",
+]
