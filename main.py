@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
+# A siplified version of the PointNetPolylineEncoder class
+# https://github.com/sshaoshuai/MTR
 class PolylineEncoder(nn.Module):
     def __init__(self, in_channels, hidden_dim):
         super().__init__()
@@ -11,22 +13,33 @@ class PolylineEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-    def forward(self, polylines):
+    def forward(self, polylines, polylines_mask):
         """
         Args:
-            polylines (Tensor): Shape (B, N, P, C). Masked points are expected to be zero.
+            polylines (Tensor): Shape (B, N, P, C).
+            polylines_mask (Tensor): Shape (B, N, P), boolean mask where True indicates a valid point.
         Returns:
             Tensor: Shape (B, N, H) -> Batch, NumPolylines, HiddenDim
         """
-        # Apply MLP to each point independently
-        point_features = self.point_mlp(polylines) # (B, N, P, H)
+        batch_size, num_polylines, num_points, _ = polylines.shape
+        hidden_dim = self.point_mlp[-1].out_features
 
-        # Max-pool across the points of each polyline to get a global feature
-        polyline_features, _ = torch.max(point_features, dim=2) # (B, N, H)
+        # Process only the valid points for efficiency
+        valid_features = self.point_mlp(polylines[polylines_mask])
+
+        # Scatter the computed features back into a zero-padded tensor
+        point_features = polylines.new_zeros(batch_size, num_polylines, num_points, hidden_dim)
+        point_features[polylines_mask] = valid_features
+
+        # Set ignored points to a large negative value for robust max-pooling
+        # The mask needs to be inverted (~polylines_mask) to select the points to ignore.
+        point_features[~polylines_mask] = -1e9
+
+        # Max-pool across the points of each polyline to get a global feature.
+        polyline_features, _ = torch.max(point_features, dim=2)
         return polyline_features
 
 
-# This decoder remains the same.
 class PointwisePredictionDecoder(nn.Module):
     def __init__(self, hidden_dim, point_channels):
         super().__init__()
@@ -41,7 +54,7 @@ class PointwisePredictionDecoder(nn.Module):
         return self.decoder_mlp(combined_features)
 
 
-# Main model for the self-supervised task
+# Main model for the self-supervised training task
 class SelfSupervisedModel(nn.Module):
     def __init__(self, encoder, decoder, mask_ratio=0.25):
         super().__init__()
@@ -56,14 +69,18 @@ class SelfSupervisedModel(nn.Module):
         """
         # --- 1. Create mask and apply it to the input ---
         point_mask = torch.rand(polylines.shape[:-1], device=polylines.device) < self.mask_ratio
+
+        # The encoder expects a mask where True means the point is VALID/VISIBLE
+        # So we invert the point_mask.
+        visible_points_mask = ~point_mask
         
-        # Create a single version of the polylines where masked points are zeroed out.
-        masked_polylines = polylines.clone()
-        masked_polylines[point_mask.unsqueeze(-1).expand_as(polylines)] = 0.0
+        # The decoder needs a version of the polylines where masked points are zeroed out.
+        masked_polylines_for_decoder = polylines.clone()
+        masked_polylines_for_decoder[point_mask.unsqueeze(-1).expand_as(polylines)] = 0.0
 
         # --- 2. Encode the masked polylines to get a GLOBAL feature ---
         # The modified encoder will now correctly handle the zeroed-out points.
-        global_feature = self.encoder(masked_polylines)
+        global_feature = self.encoder(polylines, visible_points_mask)
 
         # --- 3. Prepare input for the Pointwise Decoder ---
         batch_size, num_polylines, num_points, _ = polylines.shape
@@ -72,8 +89,8 @@ class SelfSupervisedModel(nn.Module):
             batch_size, num_polylines, num_points, -1
         )
         
-        # Decoder input uses the same masked polylines.
-        decoder_input = torch.cat([global_feature_expanded, masked_polylines], dim=-1)
+        # Decoder input uses the global feature and the zero-masked polylines.
+        decoder_input = torch.cat([global_feature_expanded, masked_polylines_for_decoder], dim=-1)
 
         # --- 4. Decode to predict all points ---
         predicted_polylines = self.decoder(decoder_input)
@@ -90,7 +107,7 @@ class SelfSupervisedModel(nn.Module):
         
         return loss, predicted_polylines
 
-# --- NEW FUNCTION TO GENERATE STRUCTURED DATA ---
+# --- FUNCTION TO GENERATE STRUCTURED POLYLINE DATA ---
 def generate_structured_polylines(batch_size, num_polylines, num_points, channels):
     """
     Generates polylines that have actual structure by making them random walks.
@@ -110,13 +127,14 @@ def generate_structured_polylines(batch_size, num_polylines, num_points, channel
 
 
 def main():
-    # --- 1. Setup Device (GPU or CPU) ---
+    # --- Setup Device (GPU or CPU) ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # --- Model Hyperparameters ---
     IN_CHANNELS = 2
     HIDDEN_DIM = 128
+    MASK_RATIO = 0.45
     
     # --- Data Shape ---
     BATCH_SIZE = 4
@@ -128,7 +146,7 @@ def main():
     # --- Instantiate Model Components ---
     encoder = PolylineEncoder(in_channels=IN_CHANNELS, hidden_dim=HIDDEN_DIM)
     decoder = PointwisePredictionDecoder(hidden_dim=HIDDEN_DIM, point_channels=IN_CHANNELS)
-    ssl_model = SelfSupervisedModel(encoder, decoder, mask_ratio=0.45).to(device)
+    ssl_model = SelfSupervisedModel(encoder, decoder, mask_ratio=MASK_RATIO).to(device)
     optimizer = torch.optim.Adam(ssl_model.parameters(), lr=LEARNING_RATE)
     
     # --- Create Structured Dummy Data ---
@@ -151,7 +169,7 @@ def main():
 
     print("✅ Training complete.")
 
-    # --- 4. Visualize Results ---
+    # --- Visualize Results ---
     plt.figure(figsize=(10, 5))
     plt.plot(loss_history)
     plt.title("Training Loss Over Time (Corrected Model with Structured Data)")
