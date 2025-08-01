@@ -10,4 +10,5 @@ dependencies = [
     "numpy>=2.3.2",
     "osmnx>=2.0.5",
     "torch>=2.7.1",
+    "tqdm>=4.67.1",
 ]

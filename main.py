@@ -1,11 +1,26 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # A siplified version of the PointNetPolylineEncoder class
 # https://github.com/sshaoshuai/MTR
 class PolylineEncoder(nn.Module):
+    """
+    Encodes a batch of polylines into a fixed-size global feature vector for each polyline.
+    It uses a PointNet-like architecture where each point is processed by an MLP,
+    and a symmetric function (max-pooling) aggregates point features.
+
+    A siplified version of the PointNetPolylineEncoder class
+    https://github.com/sshaoshuai/MTR
+    """
     def __init__(self, in_channels, hidden_dim):
+        """
+        Args:
+            in_channels (int): The number of input channels for each point (e.g., 2 for x, y).
+            hidden_dim (int): The dimensionality of the hidden and output features.
+        """
         super().__init__()
         self.point_mlp = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
@@ -15,11 +30,17 @@ class PolylineEncoder(nn.Module):
 
     def forward(self, polylines, polylines_mask):
         """
+        Forward pass for the PolylineEncoder.
+
         Args:
-            polylines (Tensor): Shape (B, N, P, C).
-            polylines_mask (Tensor): Shape (B, N, P), boolean mask where True indicates a valid point.
+            polylines (torch.Tensor): The input polylines tensor.
+                                      Shape: (Batch, NumPolylines, NumPoints, Channels).
+            polylines_mask (torch.Tensor): A boolean mask indicating valid points.
+                                           Shape: (Batch, NumPolylines, NumPoints), True for valid.
+
         Returns:
-            Tensor: Shape (B, N, H) -> Batch, NumPolylines, HiddenDim
+            torch.Tensor: The global feature vector for each polyline.
+                          Shape: (Batch, NumPolylines, HiddenDim).
         """
         batch_size, num_polylines, num_points, _ = polylines.shape
         hidden_dim = self.point_mlp[-1].out_features
@@ -41,8 +62,18 @@ class PolylineEncoder(nn.Module):
 
 
 class PointwisePredictionDecoder(nn.Module):
+    """
+    Decodes a combined feature vector (global context + local point info)
+    to predict the coordinates of each point in a polyline.
+    """
     def __init__(self, hidden_dim, point_channels):
+        """
+        Args:
+            hidden_dim (int): The dimensionality of the global polyline feature.
+            point_channels (int): The number of output channels for each point (e.g., 2 for x, y).
+        """
         super().__init__()
+        # The decoder's input is the concatenation of the global feature and the point's own data.
         decoder_in_dim = hidden_dim + point_channels
         self.decoder_mlp = nn.Sequential(
             nn.Linear(decoder_in_dim, hidden_dim * 2),
@@ -51,11 +82,27 @@ class PointwisePredictionDecoder(nn.Module):
         )
 
     def forward(self, combined_features):
+        """
+        Forward pass for the PointwisePredictionDecoder.
+
+        Args:
+            combined_features (torch.Tensor): Concatenated global and local features.
+                                              Shape: (B, N, P, HiddenDim + PointChannels).
+
+        Returns:
+            torch.Tensor: The predicted coordinates for each point.
+                          Shape: (B, N, P, PointChannels).
+        """
         return self.decoder_mlp(combined_features)
 
 
 # Main model for the self-supervised training task
 class SelfSupervisedModel(nn.Module):
+    """
+    Main model that orchestrates the self-supervised masked point prediction task.
+    It masks a portion of the input polylines, encodes them, and then decodes
+    to reconstruct the original, unmasked points.
+    """
     def __init__(self, encoder, decoder, mask_ratio=0.25):
         super().__init__()
         self.encoder = encoder
@@ -65,37 +112,39 @@ class SelfSupervisedModel(nn.Module):
 
     def forward(self, polylines):
         """
-        Performs the self-supervised masked point prediction task.
+        Performs one forward pass of self-supervised masked point prediction.
+
+        Args:
+            polylines (torch.Tensor): The ground truth polylines.
+                                      Shape: (B, N, P, C).
+
+        Returns:
+            - loss (torch.Tensor): The reconstruction loss on the masked points.
+            - predictions (torch.Tensor): The reconstructed polylines.
         """
-        # --- 1. Create mask and apply it to the input ---
+        # 1. Create a random mask to hide a portion of the points.
+        # `point_mask` is True for points we want to HIDE.
         point_mask = torch.rand(polylines.shape[:-1], device=polylines.device) < self.mask_ratio
 
-        # The encoder expects a mask where True means the point is VALID/VISIBLE
-        # So we invert the point_mask.
+        # The encoder expects a mask where True means the point is VISIBLE
         visible_points_mask = ~point_mask
         
         # The decoder needs a version of the polylines where masked points are zeroed out.
         masked_polylines_for_decoder = polylines.clone()
         masked_polylines_for_decoder[point_mask.unsqueeze(-1).expand_as(polylines)] = 0.0
 
-        # --- 2. Encode the masked polylines to get a GLOBAL feature ---
-        # The modified encoder will now correctly handle the zeroed-out points.
+        # 2. Encode the polylines using the visbility mask.
         global_feature = self.encoder(polylines, visible_points_mask)
 
-        # --- 3. Prepare input for the Pointwise Decoder ---
+        # 3. Prepare the decoder input by combining global and local information.
         batch_size, num_polylines, num_points, _ = polylines.shape
-        
-        global_feature_expanded = global_feature.unsqueeze(2).expand(
-            batch_size, num_polylines, num_points, -1
-        )
-        
-        # Decoder input uses the global feature and the zero-masked polylines.
+        global_feature_expanded = global_feature.unsqueeze(2).expand(-1, -1, num_points, -1)
         decoder_input = torch.cat([global_feature_expanded, masked_polylines_for_decoder], dim=-1)
-
-        # --- 4. Decode to predict all points ---
+        
+        # 4. Decode to predict all points.
         predicted_polylines = self.decoder(decoder_input)
 
-        # --- 5. Calculate loss ONLY on the points that were masked ---
+        # 5. Calculate loss ONLY on the points that were masked.
         target_points = polylines[point_mask.unsqueeze(-1).expand_as(polylines)]
         predicted_points = predicted_polylines[point_mask.unsqueeze(-1).expand_as(polylines)]
         
@@ -108,23 +157,35 @@ class SelfSupervisedModel(nn.Module):
         return loss, predicted_polylines
 
 # --- FUNCTION TO GENERATE STRUCTURED POLYLINE DATA ---
-def generate_structured_polylines(batch_size, num_polylines, num_points, channels):
+def generate_structured_polylines(num_samples, num_polylines, num_points, channels):
     """
     Generates polylines that have actual structure by making them random walks.
     This provides a meaningful correlation for the model to learn.
     """
-    # Start with a random initial point for each polyline
-    polylines = torch.randn(batch_size, num_polylines, 1, channels)
-    
-    # Sequentially generate the rest of the points
-    all_points = [polylines]
-    for _ in range(1, num_points):
-        # Add a small random step to the last point to get the next point
-        next_step = polylines[:, :, -1:, :] + torch.randn(batch_size, num_polylines, 1, channels) * 0.1
-        all_points.append(next_step)
-        
-    return torch.cat(all_points, dim=2)
+    # Generate all the small random steps at once
+    steps = torch.randn(num_samples, num_polylines, num_points, channels) * 0.1
+    # Set the first "step" to be the initial random position
+    steps[:, :, 0, :] = torch.randn(num_samples, num_polylines, channels)
+    # Use cumulative sum to create the random walk paths
+    return torch.cumsum(steps, dim=2)
 
+class PolylineDataset(Dataset):
+    """
+    A memory-efficient dataset that generates structured polyline data on-the-fly.
+    This pattern is scalable for large datasets that cannot fit into memory.
+    """
+    def __init__(self, num_samples, num_polylines, num_points, channels):
+        self.num_samples = num_samples
+        self.num_polylines = num_polylines
+        self.num_points = num_points
+        self.channels = channels
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # Generate one sample (e.g., one "scene" of polylines) on the fly.
+        return generate_structured_polylines(1, self.num_polylines, self.num_points, self.channels).squeeze(0)
 
 def main():
     # --- Setup Device (GPU or CPU) ---
@@ -137,35 +198,58 @@ def main():
     MASK_RATIO = 0.45
     
     # --- Data Shape ---
-    BATCH_SIZE = 4
+    NUM_SAMPLES = 128 # Total number of "scenes" in our dataset
+    BATCH_SIZE = 16 
     NUM_POLYLINES = 1024
     NUM_POINTS = 20
     LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 500
+    NUM_EPOCHS = 50
     
     # --- Instantiate Model Components ---
     encoder = PolylineEncoder(in_channels=IN_CHANNELS, hidden_dim=HIDDEN_DIM)
     decoder = PointwisePredictionDecoder(hidden_dim=HIDDEN_DIM, point_channels=IN_CHANNELS)
     ssl_model = SelfSupervisedModel(encoder, decoder, mask_ratio=MASK_RATIO).to(device)
-    optimizer = torch.optim.Adam(ssl_model.parameters(), lr=LEARNING_RATE)
-    
-    # --- Create Structured Dummy Data ---
-    # Instead of pure random noise, we generate data with inherent structure.
-    dummy_osm_data = generate_structured_polylines(BATCH_SIZE, NUM_POLYLINES, NUM_POINTS, IN_CHANNELS).to(device)
 
+    optimizer = torch.optim.Adam(ssl_model.parameters(), lr=LEARNING_RATE)
+
+    # --- Create Dataset and DataLoader ---
+    use_gpu = device.type == 'cuda'
+    dataset = PolylineDataset(NUM_SAMPLES, NUM_POLYLINES, NUM_POINTS, IN_CHANNELS)
+    train_dataloader = DataLoader(
+        dataset, 
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
     # --- Training Loop ---
     print("\n🔥 Starting training with structured data...")
+    print(f"Dataset size: {len(dataset)} samples, Batch size: {BATCH_SIZE}, Steps per epoch: {len(train_dataloader)}")
+    
     loss_history = []
     for epoch in range(NUM_EPOCHS):
         ssl_model.train()
-        optimizer.zero_grad()
-        loss, _ = ssl_model(dummy_osm_data)
-        loss.backward()
-        optimizer.step()
+        epoch_loss = 0.0
+
+        # Use tqdm for a clean progress bar
+        progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=False)
+        for batch_data in progress_bar:
+            # Move the batch to the selected device
+            polylines_batch = batch_data.to(device, non_blocking=use_gpu)
+            
+            optimizer.zero_grad()
+            loss, _ = ssl_model(polylines_batch)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            progress_bar.set_postfix(loss=f'{loss.item():.6f}')
         
-        loss_history.append(loss.item())
-        if (epoch + 1) % 50 == 0:
-            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {loss.item():.6f}")
+        avg_epoch_loss = epoch_loss / len(train_dataloader)
+        loss_history.append(avg_epoch_loss)
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_epoch_loss:.6f}")
 
     print("✅ Training complete.")
 

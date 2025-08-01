@@ -6,5 +6,7 @@ dist/
 wheels/
 *.egg-info
 
+training_loss.png
+
 # Virtual environments
 .venv
