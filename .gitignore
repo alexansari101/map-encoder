@@ -8,6 +8,7 @@ wheels/
 
 data/
 cache/
+checkpoints/
 visualizations/
 training_loss.png
 

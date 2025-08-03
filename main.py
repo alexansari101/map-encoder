@@ -8,6 +8,8 @@ from typing import Tuple, List, Union
 from dataclasses import dataclass
 import numpy as np
 import random
+import argparse
+import shutil
 
 import osmnx as ox
 from pyproj import Transformer
@@ -24,6 +26,7 @@ class TrainConfig:
     
     # Data & Training Hyperparameters
     data_dir: str = './data/sf_scenes'
+    checkpoint_dir: str = './checkpoints'
     val_split_ratio: float = 0.2
     scene_size_meters: int = 500 # The width and height of a scene
     batch_size: int = 4
@@ -35,7 +38,7 @@ class TrainConfig:
 
     # Visualization
     visualization_dir: str = './visualizations'
-    num_visualizations: int = 10 # Max number of example plots to generate
+    max_num_visualizations: int = 10 # Max number of example plots to generate
 
 # A siplified version of the PointNetPolylineEncoder class
 # https://github.com/sshaoshuai/MTR
@@ -342,67 +345,81 @@ def variable_length_collate_fn(batch: List[List[torch.Tensor]]) -> Tuple[torch.T
             
     return padded_polylines, padding_mask
 
-# --- Trainer Class ---
 class Trainer:
-    """Encapsulates the training and validation loops."""
+    """Encapsulates the training loop, checkpointing, and validation."""
     def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, train_loader: DataLoader, val_loader: DataLoader, config: TrainConfig, device: torch.device):
-        self.model = model
-        self.optimizer = optimizer
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.config = config
-        self.device = device
-        self.train_loss_history = []
-        self.val_loss_history = []
+        self.model, self.optimizer, self.train_loader, self.val_loader, self.config, self.device = model, optimizer, train_loader, val_loader, config, device
+        self.train_loss_history, self.val_loss_history = [], []
+        self.start_epoch = 0
+        self.best_val_loss = float('inf')
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+
+    def save_checkpoint(self, epoch: int, is_best: bool):
+        """Saves the current training state to a checkpoint file."""
+        state = {
+            'epoch': epoch + 1,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_val_loss': self.best_val_loss,
+        }
+        latest_path = os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt')
+        torch.save(state, latest_path)
+        if is_best:
+            best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
+            shutil.copyfile(latest_path, best_path)
+            print(f"   -> New best model saved with val_loss: {self.best_val_loss:.6f}")
+
+    def load_checkpoint(self):
+        """Loads training state from the latest checkpoint."""
+        latest_path = os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.exists(latest_path):
+            print(f"Resuming training from checkpoint: {latest_path}")
+            checkpoint = torch.load(latest_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.start_epoch = checkpoint['epoch']
+            self.best_val_loss = checkpoint['best_val_loss']
+        else:
+            print("No checkpoint found. Starting training from scratch.")
 
     def _run_epoch(self, epoch_num: int, is_training: bool) -> float:
-        """Runs a single epoch of either training or validation."""
         loader = self.train_loader if is_training else self.val_loader
         self.model.train(is_training)
-        
         epoch_loss = 0.0
         desc = "Training" if is_training else "Validating"
         progress_bar = tqdm(loader, desc=f"Epoch {epoch_num+1}/{self.config.num_epochs} - {desc}", leave=False)
-        
         for polylines_batch, padding_mask_batch in progress_bar:
             if polylines_batch.numel() == 0: continue
-            
-            polylines_batch = polylines_batch.to(self.device, non_blocking=True)
-            padding_mask_batch = padding_mask_batch.to(self.device, non_blocking=True)
-            
-            if is_training:
-                self.optimizer.zero_grad()
-            
+            polylines_batch, padding_mask_batch = polylines_batch.to(self.device, non_blocking=True), padding_mask_batch.to(self.device, non_blocking=True)
+            if is_training: self.optimizer.zero_grad()
             loss, _ = self.model(polylines_batch, padding_mask_batch)
-            
             if is_training:
                 loss.backward()
                 self.optimizer.step()
-            
             epoch_loss += loss.item()
             progress_bar.set_postfix(loss=f'{loss.item():.6f}')
-        
         return epoch_loss / len(loader) if len(loader) > 0 else 0.0
 
     def train(self):
         print("\n🔥 Starting training...")
-        for epoch in range(self.config.num_epochs):
+        for epoch in range(self.start_epoch, self.config.num_epochs):
             train_loss = self._run_epoch(epoch, is_training=True)
             self.train_loss_history.append(train_loss)
-            
-            with torch.no_grad():
-                val_loss = self._run_epoch(epoch, is_training=False)
+            with torch.no_grad(): val_loss = self._run_epoch(epoch, is_training=False)
             self.val_loss_history.append(val_loss)
             
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{self.config.num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+            is_best = val_loss < self.best_val_loss
+            if is_best: self.best_val_loss = val_loss
+            
+            self.save_checkpoint(epoch, is_best)
+            print(f"Epoch [{epoch+1}/{self.config.num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         print("✅ Training complete.")
 
 def generate_visualizations(model: SelfSupervisedModel, dataloader: DataLoader, device: torch.device, config: TrainConfig):
     """
     Generates and saves a gallery of model prediction visualizations from a single batch.
     """
-    print(f"Generating up to {config.num_visualizations} visualizations...")
+    print(f"Generating up to {config.max_num_visualizations} visualizations...")
     os.makedirs(config.visualization_dir, exist_ok=True)
     
     model.eval()
@@ -425,7 +442,7 @@ def generate_visualizations(model: SelfSupervisedModel, dataloader: DataLoader, 
 
         # Base the number of visualizations on the ACTUAL batch size, not the configured one.
         actual_batch_size = polylines_batch.shape[0]
-        num_to_generate = min(config.num_visualizations, actual_batch_size)
+        num_to_generate = min(config.max_num_visualizations, actual_batch_size)
         
         for sample_idx in range(num_to_generate):
             scene_polylines = polylines_batch[sample_idx]
@@ -480,12 +497,21 @@ def generate_visualizations(model: SelfSupervisedModel, dataloader: DataLoader, 
     print(f"📈 {num_to_generate} visualizations saved to {config.visualization_dir}")
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Train and visualize a self-supervised polyline model.")
+    parser.add_argument('--force-rebuild', action='store_true', help="Force deletion and rebuilding of the dataset.")
+    parser.add_argument('--train', action='store_true', help="Run the training loop.")
+    parser.add_argument('--visualize', action='store_true', help="Generate visualizations using the best model.")
+    args = parser.parse_args()
+
     config = TrainConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- 1. Build Dataset if it doesn't exist ---
-    if not os.path.exists(config.data_dir) or not os.listdir(config.data_dir):
+    # --- 1. Handle Data ---
+    if args.force_rebuild and os.path.exists(config.data_dir):
+        print(f"Deleting existing dataset at {config.data_dir}...")
+        shutil.rmtree(config.data_dir)
+    if not os.path.exists(config.data_dir) or not os.listdir(os.path.join(config.data_dir, 'train')):
         build_osm_dataset(config)
 
     # --- 2. Setup Model, Optimizer, and DataLoaders ---
@@ -494,35 +520,51 @@ def main() -> None:
     model = SelfSupervisedModel(encoder, decoder, config.mask_ratio).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    train_dataset = OSMDataset(data_dir=config.data_dir, split='train')
-    val_dataset = OSMDataset(data_dir=config.data_dir, split='val')
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=config.batch_size, shuffle=False,
-        num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn
-    )
-    # --- 3. Instantiate and run the Trainer ---
-    trainer = Trainer(model, optimizer, train_loader, val_loader, config, device)
-    trainer.train()
+    # --- 3. Conditional Execution Logic ---
+    best_model_path = os.path.join(config.checkpoint_dir, 'best_model.pt')
+    # If no flags are specified, default to training if no model exists, else visualize.
+    if not args.train and not args.visualize:
+        if os.path.exists(best_model_path):
+            print("No action specified, but a trained model was found. Running visualization.")
+            args.visualize = True
+        else:
+            print("No action specified and no trained model found. Running training.")
+            args.train = True
 
-    # --- 4. Visualize and Save Results ---
-    plt.figure(figsize=(10, 5))
-    plt.plot(trainer.train_loss_history, label='Training Loss')
-    plt.plot(trainer.val_loss_history, label='Validation Loss')
-    plt.title("Training and Validation Loss Over Time")
-    plt.xlabel("Epoch")
-    plt.ylabel("Average L1 Reconstruction Loss")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('training_loss.png')
-    print("📈 Plot saved to training_loss.png")    # --- Visualize Results ---
+    # --- 4. Run Training ---
+    if args.train:
+        train_dataset = OSMDataset(data_dir=config.data_dir, split='train')
+        val_dataset = OSMDataset(data_dir=config.data_dir, split='val')
+        train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn)
+        trainer = Trainer(model, optimizer, train_loader, val_loader, config, device)
+        trainer.load_checkpoint()
+        trainer.train()
 
-    # Generate and save a gallery of visualizations
-    generate_visualizations(model, val_loader, device, config)
+        # Plot training history after training is complete
+        plt.figure(figsize=(10, 5))
+        plt.plot(trainer.train_loss_history, label='Training Loss')
+        plt.plot(trainer.val_loss_history, label='Validation Loss')
+        plt.title("Training and Validation Loss Over Time"); plt.xlabel("Epoch"); plt.ylabel("Average L1 Reconstruction Loss")
+        plt.legend(); plt.grid(True)
+        plt.savefig('training_loss.png')
+        print("📈 Plot saved to training_loss.png")
+
+    # --- 5. Run Visualization ---
+    if args.visualize:
+        if not args.train: # If we only visualize, we need to load the best model
+            if os.path.exists(best_model_path):
+                print(f"Loading best model from {best_model_path} for visualization.")
+                checkpoint = torch.load(best_model_path, map_location=device)
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                print("Cannot run visualization: No trained model found. Please run with --train first.")
+                return
+        
+        # We need a dataloader for visualization regardless
+        val_dataset = OSMDataset(data_dir=config.data_dir, split='val')
+        val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn)
+        generate_visualizations(model, val_loader, device, config)
 
 
 if __name__ == "__main__":
