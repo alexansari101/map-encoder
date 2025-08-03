@@ -267,20 +267,22 @@ name = "map-encoder"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "geopandas" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "osmnx" },
+    { name = "pyproj" },
+    { name = "shapely" },
     { name = "torch" },
     { name = "tqdm" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "geopandas", specifier = ">=1.1.1" },
     { name = "matplotlib", specifier = ">=3.10.3" },
     { name = "numpy", specifier = ">=2.3.2" },
     { name = "osmnx", specifier = ">=2.0.5" },
+    { name = "pyproj", specifier = ">=3.7.1" },
+    { name = "shapely", specifier = ">=2.1.1" },
     { name = "torch", specifier = ">=2.7.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
 ]

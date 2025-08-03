@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -5,6 +6,12 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Tuple, List
 from dataclasses import dataclass
+import numpy as np
+import random
+
+import osmnx as ox
+from pyproj import Transformer
+from shapely.geometry import LineString, MultiLineString
 
 # --- Configuration ---
 @dataclass
@@ -16,8 +23,10 @@ class TrainConfig:
     mask_ratio: float = 0.45
     
     # Data & Training Hyperparameters
-    num_samples: int = 256
-    batch_size: int = 16
+    data_dir: str = './data/sf_scenes'
+    val_split_ratio: float = 0.2
+    scene_size_meters: int = 500 # The width and height of a scene
+    batch_size: int = 4
     learning_rate: float = 1e-4
     num_epochs: int = 50
     
@@ -175,91 +184,202 @@ class SelfSupervisedModel(nn.Module):
         
         return loss, predicted_polylines
 
-# --- Data Handling for Variable-Length Inputs ---
-def generate_variable_length_polylines(channels: int) -> torch.Tensor:
-    """Generates a single sample with a variable number of polylines and points."""
-    num_polylines = torch.randint(low=512, high=1024, size=(1,)).item()
-    num_points = torch.randint(low=10, high=20, size=(1,)).item()
+# --- Data Generation and Loading ---
+def build_osm_dataset(config: TrainConfig):
+    """
+    Fetches data from OpenStreetMap, processes it, splits it into train/val sets,
+    and saves it to disk with descriptive filenames.
+    """
+    print(f"Building OSM dataset at: {config.data_dir}")
     
-    steps = torch.randn(1, num_polylines, num_points, channels) * 0.1
-    steps[:, :, 0, :] = torch.randn(1, num_polylines, channels)
-    return torch.cumsum(steps, dim=2).squeeze(0)
+    sf_locations = [
+        "Mission Dolores Park, San Francisco", "Coit Tower, San Francisco",
+        "Conservatory of Flowers, San Francisco", "Portsmouth Square, San Francisco",
+        "Oracle Park, San Francisco", "Salesforce Park, San Francisco",
+        "Lafayette Park, San Francisco", "Alamo Square, San Francisco",
+        "Palace of Fine Arts, San Francisco", "Cole Valley, San Francisco", 
+        "Western Addition, San Francisco", "Outer Sunset, Sunset District, San Francisco"
+    ]   
 
-class VariablePolylineDataset(Dataset):
-    """Dataset that generates variable-length polylines, simulating real-world data."""
-    def __init__(self, num_samples: int, channels: int):
-        self.num_samples = num_samples
-        self.channels = channels
+    tags = {"highway": True}
+    # Create a pyproj transformer to convert from WGS84 (lat/lon) to a local projected CRS (in meters).
+    # EPSG:32610 is UTM Zone 10N, suitable for San Francisco.
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32610", always_xy=True)
+    
+    all_scenes_with_names = []
+    for place_query in tqdm(sf_locations, desc="Generating scenes from SF locations"):
+        try:
+            center_lat, center_lng = ox.geocode(place_query)
+            bbox = ox.utils_geo.bbox_from_point((center_lat, center_lng), dist=config.scene_size_meters)
+            features_gdf = ox.features_from_bbox(bbox, tags)
+            if features_gdf.empty: continue
+            
+            features_gdf_proj = ox.projection.project_gdf(features_gdf, to_crs="EPSG:32610")
+
+            # Convert the scene's center point to projected coordinates for normalization.
+            center_x, center_y = transformer.transform(center_lng, center_lat)
+            center_coords = np.array([center_x, center_y])
+            
+            polylines = []
+            for _, row in features_gdf_proj.iterrows():
+                geom = row.geometry
+                if isinstance(geom, (LineString, MultiLineString)):
+                    geoms = [geom] if isinstance(geom, LineString) else list(geom.geoms)
+                    for line in geoms:
+                        # Normalize coordinates by subtracting the scene center. This makes the model
+                        # translation-invariant, as all scenes are centered around (0,0).
+                        coords = np.array(line.coords) - center_coords
+                        polylines.append(torch.tensor(coords, dtype=torch.float32))
+            
+            if polylines:
+                # Each scene is stored as a tuple: (string_name, List[polyline_tensors])
+                short_name = place_query.split(',')[0].lower().replace(' ', '_')
+                all_scenes_with_names.append((short_name, polylines))
+
+        except Exception as e:
+            print(f"Could not process scene for '{place_query}': {e}")
+            continue
+
+    # Split scenes into train and validation sets
+    random.shuffle(all_scenes_with_names)
+    split_idx = int(len(all_scenes_with_names) * (1 - config.val_split_ratio))
+    train_scenes = all_scenes_with_names[:split_idx]
+    val_scenes = all_scenes_with_names[split_idx:]
+
+    # Save scenes to their respective directories
+    for split, scenes_with_names in [('train', train_scenes), ('val', val_scenes)]:
+        split_dir = os.path.join(config.data_dir, split)
+        os.makedirs(split_dir, exist_ok=True)
+        for name, scene_data in scenes_with_names:
+            torch.save(scene_data, os.path.join(split_dir, f"{name}.pt"))
+
+    print(f"✅ Dataset built. Train scenes: {len(train_scenes)}, Val scenes: {len(val_scenes)}")
+
+class OSMDataset(Dataset):
+    """Loads pre-processed polyline data scenes from a specific split directory."""
+    def __init__(self, data_dir: str, split: str):
+        self.split_dir = os.path.join(data_dir, split)
+        if not os.path.exists(self.split_dir):
+            raise FileNotFoundError(f"Split directory not found: {self.split_dir}. Please build the dataset first.")
+        self.file_paths = [os.path.join(self.split_dir, f) for f in os.listdir(self.split_dir) if f.endswith('.pt')]
+        if not self.file_paths:
+            raise FileNotFoundError(f"No data files found in {self.split_dir}.")
 
     def __len__(self) -> int:
-        return self.num_samples
+        return len(self.file_paths)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return generate_variable_length_polylines(self.channels)
+    def __getitem__(self, idx: int) -> List[torch.Tensor]:
+        """
+        Loads and validates a single data sample (a "scene").
 
-def variable_length_collate_fn(batch: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        Returns:
+            List[torch.Tensor]: A list of polyline tensors. Each tensor in the list
+                                has a shape of (NumPoints_i, Channels), where NumPoints_i
+                                can vary for each polyline.
+        """
+        filepath = self.file_paths[idx]
+        data = torch.load(filepath)
+
+        # Add a validation check to ensure data integrity.
+        # This will catch corrupted files immediately and provide a clear error.
+        if not isinstance(data, list) or not all(isinstance(p, torch.Tensor) for p in data):
+            raise TypeError(f"Data in file {filepath} is not a list of Tensors as expected.")
+
+        return data
+
+def variable_length_collate_fn(batch: List[List[torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Custom collate function to handle variable-length polylines by padding.
-    
+    Custom collate function to handle variable-length scenes by padding.
+
     Args:
-        batch (List[torch.Tensor]): A list of tensors from the dataset, where each
-                                     tensor has shape (NumPolylines, NumPoints, Channels).
+        batch (List[List[torch.Tensor]]): A list of scenes from the dataset.
+            - Each `scene` is a `List[torch.Tensor]`.
+            - Each `torch.Tensor` is a polyline of shape (NumPoints_i, Channels).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - padded_polylines (torch.Tensor): Padded tensor of shape (B, MaxN, MaxP, C).
-            - padding_mask (torch.Tensor): Boolean mask of shape (B, MaxN, MaxP).
+            - padded_polylines (torch.Tensor): Padded tensor of shape (B, N, P, C).
+                B: Batch Size
+                N: Max number of polylines in a scene within the batch.
+                P: Max number of points in a polyline within the batch.
+                C: Number of channels (e.g., 2 for x, y).
+            - padding_mask (torch.Tensor): Boolean mask of shape (B, N, P).
+                `True` indicates a real data point, `False` indicates padding.
     """
-    # Find the maximum number of polylines and points in the batch.
-    max_num_polylines = max(p.shape[0] for p in batch)
-    max_num_points = max(p.shape[1] for p in batch)
-    channels = batch[0].shape[2]
+    # Filter out empty scenes that might have been saved
+    batch = [scene for scene in batch if scene]
+    if not batch:
+        return torch.tensor([]), torch.tensor([])
+
+    max_num_polylines = max(len(scene) for scene in batch)
+    max_num_points = max(max(p.shape[0] for p in scene) if scene else 0 for scene in batch)
+    channels = batch[0][0].shape[1] if batch[0] else 2 # Default to 2 channels if a scene is empty
     
-    # Create padded tensors and mask.
     padded_polylines = torch.zeros(len(batch), max_num_polylines, max_num_points, channels)
     padding_mask = torch.zeros(len(batch), max_num_polylines, max_num_points, dtype=torch.bool)
     
-    for i, polylines in enumerate(batch):
-        num_polylines, num_points, _ = polylines.shape
-        padded_polylines[i, :num_polylines, :num_points] = polylines
-        padding_mask[i, :num_polylines, :num_points] = True
-        
+    for i, scene in enumerate(batch):
+        for j, polyline in enumerate(scene):
+            num_points = polyline.shape[0]
+            padded_polylines[i, j, :num_points] = polyline
+            padding_mask[i, j, :num_points] = True
+            
     return padded_polylines, padding_mask
 
+# --- Trainer Class ---
 class Trainer:
-    """Encapsulates the training loop and related logic."""
-    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, dataloader: DataLoader, config: TrainConfig, device: torch.device):
+    """Encapsulates the training and validation loops."""
+    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, train_loader: DataLoader, val_loader: DataLoader, config: TrainConfig, device: torch.device):
         self.model = model
         self.optimizer = optimizer
-        self.dataloader = dataloader
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         self.config = config
         self.device = device
-        self.loss_history = []
+        self.train_loss_history = []
+        self.val_loss_history = []
+
+    def _run_epoch(self, epoch_num: int, is_training: bool) -> float:
+        """Runs a single epoch of either training or validation."""
+        loader = self.train_loader if is_training else self.val_loader
+        self.model.train(is_training)
+        
+        epoch_loss = 0.0
+        desc = "Training" if is_training else "Validating"
+        progress_bar = tqdm(loader, desc=f"Epoch {epoch_num+1}/{self.config.num_epochs} - {desc}", leave=False)
+        
+        for polylines_batch, padding_mask_batch in progress_bar:
+            if polylines_batch.numel() == 0: continue
+            
+            polylines_batch = polylines_batch.to(self.device, non_blocking=True)
+            padding_mask_batch = padding_mask_batch.to(self.device, non_blocking=True)
+            
+            if is_training:
+                self.optimizer.zero_grad()
+            
+            loss, _ = self.model(polylines_batch, padding_mask_batch)
+            
+            if is_training:
+                loss.backward()
+                self.optimizer.step()
+            
+            epoch_loss += loss.item()
+            progress_bar.set_postfix(loss=f'{loss.item():.6f}')
+        
+        return epoch_loss / len(loader) if len(loader) > 0 else 0.0
 
     def train(self):
         print("\n🔥 Starting training...")
         for epoch in range(self.config.num_epochs):
-            self.model.train()
-            epoch_loss = 0.0
+            train_loss = self._run_epoch(epoch, is_training=True)
+            self.train_loss_history.append(train_loss)
             
-            progress_bar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}", leave=False)
-            for polylines_batch, padding_mask_batch in progress_bar:
-                polylines_batch = polylines_batch.to(self.device, non_blocking=True)
-                padding_mask_batch = padding_mask_batch.to(self.device, non_blocking=True)
-                
-                self.optimizer.zero_grad()
-                loss, _ = self.model(polylines_batch, padding_mask_batch)
-                loss.backward()
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                progress_bar.set_postfix(loss=f'{loss.item():.6f}')
+            with torch.no_grad():
+                val_loss = self._run_epoch(epoch, is_training=False)
+            self.val_loss_history.append(val_loss)
             
-            avg_epoch_loss = epoch_loss / len(self.dataloader)
-            self.loss_history.append(avg_epoch_loss)
             if (epoch + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{self.config.num_epochs}], Average Loss: {avg_epoch_loss:.6f}")
-
+                print(f"Epoch [{epoch+1}/{self.config.num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         print("✅ Training complete.")
 
 def main() -> None:
@@ -267,35 +387,42 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Instantiate Model Components ---
+    # --- 1. Build Dataset if it doesn't exist ---
+    if not os.path.exists(config.data_dir) or not os.listdir(config.data_dir):
+        build_osm_dataset(config)
+
+    # --- 2. Setup Model, Optimizer, and DataLoaders ---
     encoder = PolylineEncoder(config.in_channels, config.hidden_dim)
     decoder = PointwisePredictionDecoder(config.hidden_dim, config.in_channels)
     model = SelfSupervisedModel(encoder, decoder, config.mask_ratio).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
-    # --- Create Dataset and DataLoader ---
-    dataset = VariablePolylineDataset(config.num_samples, config.in_channels)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        collate_fn=variable_length_collate_fn
-    )
+    train_dataset = OSMDataset(data_dir=config.data_dir, split='train')
+    val_dataset = OSMDataset(data_dir=config.data_dir, split='val')
     
-    trainer = Trainer(model, optimizer, dataloader, config, device)
+    train_loader = DataLoader(
+        train_dataset, batch_size=config.batch_size, shuffle=True,
+        num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.batch_size, shuffle=False,
+        num_workers=config.num_workers, pin_memory=(device.type == 'cuda'), collate_fn=variable_length_collate_fn
+    )
+    # --- 3. Instantiate and run the Trainer ---
+    trainer = Trainer(model, optimizer, train_loader, val_loader, config, device)
     trainer.train()
 
-    # --- Visualize Results ---
+    # --- 4. Visualize and Save Results ---
     plt.figure(figsize=(10, 5))
-    plt.plot(trainer.loss_history)
-    plt.title("Training Loss Over Time (Corrected Model with Structured Data)")
+    plt.plot(trainer.train_loss_history, label='Training Loss')
+    plt.plot(trainer.val_loss_history, label='Validation Loss')
+    plt.title("Training and Validation Loss Over Time")
     plt.xlabel("Epoch")
-    plt.ylabel("L1 Reconstruction Loss")
+    plt.ylabel("Average L1 Reconstruction Loss")
+    plt.legend()
     plt.grid(True)
     plt.savefig('training_loss.png')
-    print("📈 Plot saved to training_loss.png")
+    print("📈 Plot saved to training_loss.png")    # --- Visualize Results ---
 
 
 if __name__ == "__main__":
