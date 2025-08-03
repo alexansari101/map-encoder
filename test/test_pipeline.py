@@ -1,32 +1,32 @@
-import unittest
-import torch
-from torch.utils.data import DataLoader, Dataset
-from typing import List
 import os
 import shutil
+import unittest
+from typing import List
+
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 # We need to import the core classes from your main script.
 # Assuming your main script is saved as 'main.py'
 from main import (
-    TrainConfig,
-    PolylineEncoder,
     PointwisePredictionDecoder,
+    PolylineEncoder,
     SelfSupervisedModel,
-    variable_length_collate_fn, # Import the production collate_fn
-    Trainer
+    TrainConfig,
+    Trainer,
+    variable_length_collate_fn,  # Import the production collate_fn
 )
 
 # --- Dummy Data Generation (Self-contained for testing) ---
-
 def generate_variable_length_polylines(channels: int) -> List[torch.Tensor]:
     """
     Generates a single "scene" as a list of variable-length polyline tensors,
     mimicking the structure of the real OSMDataset.
     """
-    num_polylines = torch.randint(low=64, high=128, size=(1,)).item()
+    num_polylines = int(torch.randint(low=64, high=128, size=(1,)).item())
     scene = []
     for _ in range(num_polylines):
-        num_points = torch.randint(low=10, high=20, size=(1,)).item()
+        num_points = int(torch.randint(low=10, high=20, size=(1,)).item())
         # Create a single polyline tensor
         steps = torch.randn(1, 1, num_points, channels) * 0.1
         steps[:, :, 0, :] = torch.randn(1, 1, channels)
@@ -43,7 +43,7 @@ class VariablePolylineDataset(Dataset):
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, idx: int) -> List[torch.Tensor]:
+    def __getitem__(self, _: int) -> List[torch.Tensor]:
         return generate_variable_length_polylines(self.channels)
 
 

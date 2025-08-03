@@ -13,3 +13,7 @@ dependencies = [
     "torch>=2.7.1",
     "tqdm>=4.67.1",
 ]
+
+[tool.ruff.lint]
+# E701 is the error code for "multiple statements on one line (semicolon)"
+ignore = ["E701"]

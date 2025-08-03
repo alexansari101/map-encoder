@@ -1,19 +1,20 @@
+import argparse
 import os
+import random
+import shutil
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Union
+
+import matplotlib.pyplot as plt
+import numpy as np
+import osmnx as ox
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from typing import Tuple, List, Union
-from dataclasses import dataclass
-import numpy as np
-import random
-import argparse
-import shutil
-
-import osmnx as ox
 from pyproj import Transformer
 from shapely.geometry import LineString, MultiLineString
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
 
 # --- Configuration ---
 @dataclass
@@ -58,10 +59,11 @@ class PolylineEncoder(nn.Module):
             hidden_dim (int): The dimensionality of the hidden and output features.
         """
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.point_mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
+            nn.Linear(in_channels, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
     def forward(self, polylines: torch.Tensor, polylines_mask: torch.Tensor) -> torch.Tensor:
@@ -79,13 +81,12 @@ class PolylineEncoder(nn.Module):
                           Shape: (Batch, NumPolylines, HiddenDim).
         """
         batch_size, num_polylines, num_points, _ = polylines.shape
-        hidden_dim = self.point_mlp[-1].out_features
 
         # Process only the valid points for efficiency
         valid_features = self.point_mlp(polylines[polylines_mask])
 
         # Scatter the computed features back into a zero-padded tensor
-        point_features = polylines.new_zeros(batch_size, num_polylines, num_points, hidden_dim)
+        point_features = polylines.new_zeros(batch_size, num_polylines, num_points, self.hidden_dim)
         point_features[polylines_mask] = valid_features
 
         # Set ignored points to a large negative value for robust max-pooling
@@ -220,7 +221,7 @@ def build_osm_dataset(config: TrainConfig):
         "Western Addition, San Francisco", "Outer Sunset, Sunset District, San Francisco"
     ]   
 
-    tags = {"highway": True}
+    tags: Dict[str, Union[bool, str, List[str]]] = {"highway": True}
     # Create a pyproj transformer to convert from WGS84 (lat/lon) to a local projected CRS (in meters).
     # EPSG:32610 is UTM Zone 10N, suitable for San Francisco.
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:32610", always_xy=True)
@@ -487,8 +488,8 @@ def generate_visualizations(model: SelfSupervisedModel, dataloader: DataLoader, 
                         c='green', marker='x', s=100, label='Predicted Points', zorder=5)
 
             plt.title(f"Prediction for Sample {sample_idx}, Polyline {target_polyline_idx}")
-            plt.xlabel("X (meters)"); plt.ylabel("Y (meters)")
-            plt.legend(); plt.grid(True); plt.axis('equal')
+            plt.xlabel("X (meters)"); plt.ylabel("Y (meters)")  # noqa: E702
+            plt.legend(); plt.grid(True); plt.axis('equal')  # noqa: E702
             
             save_path = os.path.join(config.visualization_dir, f"sample_{sample_idx}_polyline_{target_polyline_idx}.png")
             plt.savefig(save_path)
@@ -545,8 +546,9 @@ def main() -> None:
         plt.figure(figsize=(10, 5))
         plt.plot(trainer.train_loss_history, label='Training Loss')
         plt.plot(trainer.val_loss_history, label='Validation Loss')
-        plt.title("Training and Validation Loss Over Time"); plt.xlabel("Epoch"); plt.ylabel("Average L1 Reconstruction Loss")
-        plt.legend(); plt.grid(True)
+        plt.title("Training and Validation Loss Over Time")
+        plt.xlabel("Epoch"); plt.ylabel("Average L1 Reconstruction Loss")  # noqa: E702
+        plt.legend(); plt.grid(True)  # noqa: E702
         plt.savefig('training_loss.png')
         print("📈 Plot saved to training_loss.png")
 
