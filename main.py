@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from typing import Tuple, List
+from typing import Tuple, List, Union
 from dataclasses import dataclass
 import numpy as np
 import random
@@ -32,6 +32,10 @@ class TrainConfig:
     
     # DataLoader
     num_workers: int = 8
+
+    # Visualization
+    visualization_dir: str = './visualizations'
+    num_visualizations: int = 10 # Max number of example plots to generate
 
 # A siplified version of the PointNetPolylineEncoder class
 # https://github.com/sshaoshuai/MTR
@@ -141,9 +145,19 @@ class SelfSupervisedModel(nn.Module):
         self.mask_ratio = mask_ratio
         self.loss_fn = nn.L1Loss()
 
-    def forward(self, polylines: torch.Tensor, padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # def forward(self, polylines: torch.Tensor, padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, polylines: torch.Tensor, padding_mask: torch.Tensor, return_masks: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Performs one forward pass of self-supervised masked point prediction.
+
+        Args:
+            polylines (torch.Tensor): Ground truth polylines.
+            padding_mask (torch.Tensor): Mask for padded elements.
+            return_masks (bool): If True, returns the internal task mask for visualization.
+
+        Returns:
+            If return_masks is False: (loss, predictions)
+            If return_masks is True: (loss, predictions, task_mask)
         """
         # 1. Create a random mask to hide a portion of the points for the self-supervised task
         # True for points we want to HIDE.
@@ -178,10 +192,12 @@ class SelfSupervisedModel(nn.Module):
         
         # Avoid calculating loss if no points were masked (edge case)
         if target_points.numel() == 0:
-            return torch.tensor(0.0, device=polylines.device, requires_grad=True), predicted_polylines
-
-        loss = self.loss_fn(predicted_points, target_points)
+            loss = torch.tensor(0.0, device=polylines.device, requires_grad=True)
+        else:
+            loss = self.loss_fn(predicted_points, target_points)
         
+        if return_masks:
+            return loss, predicted_polylines, task_mask
         return loss, predicted_polylines
 
 # --- Data Generation and Loading ---
@@ -382,6 +398,87 @@ class Trainer:
                 print(f"Epoch [{epoch+1}/{self.config.num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         print("✅ Training complete.")
 
+def generate_visualizations(model: SelfSupervisedModel, dataloader: DataLoader, device: torch.device, config: TrainConfig):
+    """
+    Generates and saves a gallery of model prediction visualizations from a single batch.
+    """
+    print(f"Generating up to {config.num_visualizations} visualizations...")
+    os.makedirs(config.visualization_dir, exist_ok=True)
+    
+    model.eval()
+    with torch.no_grad():
+        # Get one batch from the validation set
+        polylines_batch, padding_mask_batch = next(iter(dataloader))
+        if polylines_batch.numel() == 0:
+            print("Skipping visualization: first validation batch was empty.")
+            return
+
+        polylines_batch = polylines_batch.to(device)
+        padding_mask_batch = padding_mask_batch.to(device)
+
+        # Run the forward pass, getting the masks back for visualization
+        _, predictions, task_mask = model(polylines_batch, padding_mask_batch, return_masks=True)
+
+        # Move results to CPU for plotting
+        polylines_batch, padding_mask_batch, predictions, task_mask = \
+            polylines_batch.cpu(), padding_mask_batch.cpu(), predictions.cpu(), task_mask.cpu()
+
+        # Base the number of visualizations on the ACTUAL batch size, not the configured one.
+        actual_batch_size = polylines_batch.shape[0]
+        num_to_generate = min(config.num_visualizations, actual_batch_size)
+        
+        for sample_idx in range(num_to_generate):
+            scene_polylines = polylines_batch[sample_idx]
+            scene_padding_mask = padding_mask_batch[sample_idx]
+            scene_predictions = predictions[sample_idx]
+            scene_task_mask = task_mask[sample_idx]
+
+            # Find all valid polylines in the current scene
+            valid_polyline_indices = torch.where(scene_padding_mask.sum(dim=-1) > 0)[0]
+            if len(valid_polyline_indices) == 0: continue
+
+            # Select a random valid polyline to visualize
+            target_polyline_idx = random.choice(valid_polyline_indices).item()
+            
+            plt.figure(figsize=(12, 12))
+            
+            # 1. Plot all polylines in the scene as faint context
+            for i, polyline in enumerate(scene_polylines):
+                valid_points = polyline[scene_padding_mask[i]]
+                plt.plot(valid_points[:, 0], valid_points[:, 1], color='gray', alpha=0.3, zorder=1)
+                
+            # 2. Extract data for the target polyline
+            target_polyline_gt = scene_polylines[target_polyline_idx][scene_padding_mask[target_polyline_idx]]
+            target_polyline_pred = scene_predictions[target_polyline_idx][scene_padding_mask[target_polyline_idx]]
+            is_masked = scene_task_mask[target_polyline_idx][scene_padding_mask[target_polyline_idx]]
+
+            # 3. Plot the target polyline segment by segment for clarity
+            for i in range(1, len(target_polyline_gt)):
+                p1, p2 = target_polyline_gt[i-1], target_polyline_gt[i]
+                if is_masked[i-1] or is_masked[i]: plt.plot([p1[0], p2[0]], [p1[1], p2[1]], 'r--', zorder=2)
+                else: plt.plot([p1[0], p2[0]], [p1[1], p2[1]], 'b-', zorder=3)
+
+            # Create dummy plots just for the legend handles
+            plt.plot([], [], 'b-', label='Visible Segments')
+            plt.plot([], [], 'r--', label='Masked Segments (Ground Truth)')
+            
+            # 4. Plot the masked and predicted points on top
+            plt.scatter(target_polyline_gt[is_masked, 0], target_polyline_gt[is_masked, 1], 
+                        edgecolors='red', facecolors='none', s=150, 
+                        label='Masked Points (Ground Truth)', zorder=4)
+            plt.scatter(target_polyline_pred[is_masked, 0], target_polyline_pred[is_masked, 1], 
+                        c='green', marker='x', s=100, label='Predicted Points', zorder=5)
+
+            plt.title(f"Prediction for Sample {sample_idx}, Polyline {target_polyline_idx}")
+            plt.xlabel("X (meters)"); plt.ylabel("Y (meters)")
+            plt.legend(); plt.grid(True); plt.axis('equal')
+            
+            save_path = os.path.join(config.visualization_dir, f"sample_{sample_idx}_polyline_{target_polyline_idx}.png")
+            plt.savefig(save_path)
+            plt.close() # Close the figure to free memory
+
+    print(f"📈 {num_to_generate} visualizations saved to {config.visualization_dir}")
+
 def main() -> None:
     config = TrainConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -423,6 +520,9 @@ def main() -> None:
     plt.grid(True)
     plt.savefig('training_loss.png')
     print("📈 Plot saved to training_loss.png")    # --- Visualize Results ---
+
+    # Generate and save a gallery of visualizations
+    generate_visualizations(model, val_loader, device, config)
 
 
 if __name__ == "__main__":
