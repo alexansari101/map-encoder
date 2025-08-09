@@ -202,11 +202,31 @@ def main() -> None:
     parser.add_argument('--force-rebuild', action='store_true', help="Force deletion and rebuilding of the dataset.")
     parser.add_argument('--train', action='store_true', help="Run the training loop.")
     parser.add_argument('--visualize', action='store_true', help="Generate visualizations using the best model.")
+    parser.add_argument('--clean', action='store_true', help="Remove dataset, checkpoints, visualizations (and training plot), then exit.")
     args = parser.parse_args()
 
     config = TrainConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+     # --- 0. Optional cleanup and exit ---
+    if args.clean:
+        def remove_dir(path: str) -> None:
+            if os.path.exists(path):
+                print(f"Deleting directory: {path}")
+                shutil.rmtree(path)
+
+        def remove_file(path: str) -> None:
+            if os.path.exists(path):
+                print(f"Deleting file: {path}")
+                os.remove(path)
+
+        remove_dir(config.data_dir)
+        remove_dir(config.checkpoint_dir)
+        remove_dir(config.visualization_dir)
+        remove_file('training_loss.png')
+        print("✅ Cleanup complete.")
+        return
 
     # --- 1. Handle Data ---
     if args.force_rebuild and os.path.exists(config.data_dir):
