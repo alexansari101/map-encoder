@@ -7,14 +7,16 @@ from typing import Dict, List, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
-import osmnx as ox
 import torch
 import torch.nn as nn
-from pyproj import Transformer
-from shapely.geometry import LineString, MultiLineString
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from models import (
+    PointwisePredictionDecoder,
+    PolylineEncoder,
+    SelfSupervisedModel,
+)
 
 # --- Configuration ---
 @dataclass
@@ -41,168 +43,6 @@ class TrainConfig:
     visualization_dir: str = './visualizations'
     max_num_visualizations: int = 10 # Max number of example plots to generate
 
-# A siplified version of the PointNetPolylineEncoder class
-# https://github.com/sshaoshuai/MTR
-class PolylineEncoder(nn.Module):
-    """
-    Encodes a batch of polylines into a fixed-size global feature vector for each polyline.
-    It uses a PointNet-like architecture where each point is processed by an MLP,
-    and a symmetric function (max-pooling) aggregates point features.
-
-    A siplified version of the PointNetPolylineEncoder class
-    https://github.com/sshaoshuai/MTR
-    """
-    def __init__(self, in_channels: int, hidden_dim: int):
-        """
-        Args:
-            in_channels (int): The number of input channels for each point (e.g., 2 for x, y).
-            hidden_dim (int): The dimensionality of the hidden and output features.
-        """
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.point_mlp = nn.Sequential(
-            nn.Linear(in_channels, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-
-    def forward(self, polylines: torch.Tensor, polylines_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the PolylineEncoder.
-
-        Args:
-            polylines (torch.Tensor): The input polylines tensor.
-                                      Shape: (Batch, NumPolylines, NumPoints, Channels).
-            polylines_mask (torch.Tensor): A boolean mask indicating valid points.
-                                           Shape: (Batch, NumPolylines, NumPoints), True for valid.
-
-        Returns:
-            torch.Tensor: The global feature vector for each polyline.
-                          Shape: (Batch, NumPolylines, HiddenDim).
-        """
-        batch_size, num_polylines, num_points, _ = polylines.shape
-
-        # Process only the valid points for efficiency
-        valid_features = self.point_mlp(polylines[polylines_mask])
-
-        # Scatter the computed features back into a zero-padded tensor
-        point_features = polylines.new_zeros(batch_size, num_polylines, num_points, self.hidden_dim)
-        point_features[polylines_mask] = valid_features
-
-        # Set ignored points to a large negative value for robust max-pooling
-        # The mask needs to be inverted (~polylines_mask) to select the points to ignore.
-        point_features[~polylines_mask] = -1e9
-
-        # Max-pool across the points of each polyline to get a global feature.
-        polyline_features, _ = torch.max(point_features, dim=2)
-        # Handle cases where a polyline has no points after masking
-        polyline_features[polyline_features == -1e9] = 0
-        return polyline_features
-
-
-class PointwisePredictionDecoder(nn.Module):
-    """
-    Decodes a combined feature vector (global context + local point info)
-    to predict the coordinates of each point in a polyline.
-    """
-    def __init__(self, hidden_dim: int, point_channels: int):
-        """
-        Args:
-            hidden_dim (int): The dimensionality of the global polyline feature.
-            point_channels (int): The number of output channels for each point (e.g., 2 for x, y).
-        """
-        super().__init__()
-        # The decoder's input is the concatenation of the global feature and the point's own data.
-        decoder_in_dim = hidden_dim + point_channels
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(decoder_in_dim, hidden_dim * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim * 2, point_channels)
-        )
-
-    def forward(self, combined_features: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the PointwisePredictionDecoder.
-
-        Args:
-            combined_features (torch.Tensor): Concatenated global and local features.
-                                              Shape: (B, N, P, HiddenDim + PointChannels).
-
-        Returns:
-            torch.Tensor: The predicted coordinates for each point.
-                          Shape: (B, N, P, PointChannels).
-        """
-        return self.decoder_mlp(combined_features)
-
-
-# Main model for the self-supervised training task
-class SelfSupervisedModel(nn.Module):
-    """
-    Main model that orchestrates the self-supervised masked point prediction task.
-    It masks a portion of the input polylines, encodes them, and then decodes
-    to reconstruct the original, unmasked points.
-    """
-    def __init__(self, encoder: PolylineEncoder, decoder: PointwisePredictionDecoder, mask_ratio: float):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.mask_ratio = mask_ratio
-        self.loss_fn = nn.L1Loss()
-
-    # def forward(self, polylines: torch.Tensor, padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    def forward(self, polylines: torch.Tensor, padding_mask: torch.Tensor, return_masks: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """
-        Performs one forward pass of self-supervised masked point prediction.
-
-        Args:
-            polylines (torch.Tensor): Ground truth polylines.
-            padding_mask (torch.Tensor): Mask for padded elements.
-            return_masks (bool): If True, returns the internal task mask for visualization.
-
-        Returns:
-            If return_masks is False: (loss, predictions)
-            If return_masks is True: (loss, predictions, task_mask)
-        """
-        # 1. Create a random mask to hide a portion of the points for the self-supervised task
-        # True for points we want to HIDE.
-        task_mask = torch.rand(polylines.shape[:-1], device=polylines.device) < self.mask_ratio
-
-        # 2. Combine the padding mask and the task mask. A point is visible to the encoder
-        #    only if it's NOT padding AND it's NOT masked for the task.
-        visible_points_mask = padding_mask & ~task_mask
-        
-        # 3. For the decoder's input, zero out points that are either padding or task-masked.
-        masked_polylines_for_decoder = polylines.clone()
-        # Create a combined mask for zeroing out points.
-        combined_mask_for_zeroing = ~visible_points_mask
-        masked_polylines_for_decoder[combined_mask_for_zeroing.unsqueeze(-1).expand_as(polylines)] = 0.0
-
-        # 4. Encode the polylines using the visbility mask.
-        global_feature = self.encoder(polylines, visible_points_mask)
-
-        # 5. Prepare decoder input.
-        _, _, num_points, _ = polylines.shape
-        global_feature_expanded = global_feature.unsqueeze(2).expand(-1, -1, num_points, -1)
-        decoder_input = torch.cat([global_feature_expanded, masked_polylines_for_decoder], dim=-1)
-
-        # 6. Decode to predict all points.
-        predicted_polylines = self.decoder(decoder_input)
-
-        # 7. Calculate loss ONLY on points that were part of the task mask (and not padding).
-        target_points_mask = padding_mask & task_mask
-        target_points = polylines[target_points_mask.unsqueeze(-1).expand_as(polylines)]
-        predicted_points = predicted_polylines[target_points_mask.unsqueeze(-1).expand_as(polylines)]
-
-        
-        # Avoid calculating loss if no points were masked (edge case)
-        if target_points.numel() == 0:
-            loss = torch.tensor(0.0, device=polylines.device, requires_grad=True)
-        else:
-            loss = self.loss_fn(predicted_points, target_points)
-        
-        if return_masks:
-            return loss, predicted_polylines, task_mask
-        return loss, predicted_polylines
 
 # --- Data Generation and Loading ---
 def build_osm_dataset(config: TrainConfig):
@@ -210,6 +50,11 @@ def build_osm_dataset(config: TrainConfig):
     Fetches data from OpenStreetMap, processes it, splits it into train/val sets,
     and saves it to disk with descriptive filenames.
     """
+    # Localize heavy/optional imports to avoid import-time failures when only using the models
+    import osmnx as ox
+    from pyproj import Transformer
+    from shapely.geometry import LineString, MultiLineString
+
     print(f"Building OSM dataset at: {config.data_dir}")
     
     sf_locations = [

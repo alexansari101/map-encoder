@@ -8,10 +8,12 @@ from torch.utils.data import DataLoader, Dataset
 
 # We need to import the core classes from your main script.
 # Assuming your main script is saved as 'main.py'
-from main import (
+from models import (
     PointwisePredictionDecoder,
     PolylineEncoder,
     SelfSupervisedModel,
+)
+from main import (
     TrainConfig,
     Trainer,
     variable_length_collate_fn,  # Import the production collate_fn
