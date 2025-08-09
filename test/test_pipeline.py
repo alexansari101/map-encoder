@@ -16,8 +16,8 @@ from models import (
 from main import (
     TrainConfig,
     Trainer,
-    variable_length_collate_fn,  # Import the production collate_fn
 )
+from osm_data import variable_length_collate_fn  # Import the production collate_fn
 
 # --- Dummy Data Generation (Self-contained for testing) ---
 def generate_variable_length_polylines(channels: int) -> List[torch.Tensor]:
